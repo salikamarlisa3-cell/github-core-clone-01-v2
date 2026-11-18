@@ -22,7 +22,7 @@ export function isOid(value: string): boolean {
 /** git's object id: SHA-1 over `<type> <size>\0` + the object's bytes. */
 export function hashObject(type: GitObjectType, data: Buffer): string {
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
+  hash.update(`${type} ${data.length}\0`, 'utf8');
   hash.update(data);
   return hash.digest('hex');
 }
@@ -242,9 +242,10 @@ export function reachableSet(
     if (object === undefined) continue;
     if (object.type === 'commit') {
       out.add(oid);
-      addTreeClosure(store, parseCommit(object.data).tree, out);
+      const commit = parseCommit(object.data);
+      addTreeClosure(store, commit.tree, out);
       if (options.stopAt?.has(oid) !== true) {
-        for (const parent of parseCommit(object.data).parents) queue.push(parent);
+        for (const parent of commit.parents) queue.push(parent);
       }
     } else if (object.type === 'tag') {
       out.add(oid);
@@ -482,10 +483,15 @@ function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number
 }
 
 /**
- * Read a packfile and resolve every object, including OFS_DELTA and REF_DELTA entries.
+ * Read a packfile and resolve every object, including OFS_DELTA and REF_DELTA entries,
+ * answering each object with the id the resolution already computed for it (so a caller
+ * storing the objects need not hash them a second time).
  * `resolveBase` supplies a base object a thin pack leaves out (looked up in the repo store).
  */
-export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): GitObject[] {
+export function readPackObjects(
+  pack: Buffer,
+  resolveBase?: (oid: string) => GitObject | undefined,
+): Array<{ oid: string; object: GitObject }> {
   if (pack.length < 32 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
@@ -544,13 +550,22 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     }
     return { type: CODE_TYPE[entry.typeCode] as GitObjectType, data: entry.data };
   };
-  const objects: GitObject[] = [];
+  const objects: Array<{ oid: string; object: GitObject }> = [];
   for (const entry of raw) {
     const object = resolve(entry);
-    resolvedByOid.set(hashObject(object.type, object.data), object);
-    objects.push(object);
+    const oid = hashObject(object.type, object.data);
+    resolvedByOid.set(oid, object);
+    objects.push({ oid, object });
   }
   return objects;
+}
+
+/**
+ * Read a packfile and resolve every object, including OFS_DELTA and REF_DELTA entries.
+ * `resolveBase` supplies a base object a thin pack leaves out (looked up in the repo store).
+ */
+export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): GitObject[] {
+  return readPackObjects(pack, resolveBase).map((entry) => entry.object);
 }
 
 // ---------------------------------------------------------------------------------------------

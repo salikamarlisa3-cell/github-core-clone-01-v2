@@ -517,6 +517,7 @@ function resolveField(typeName: string, source: Source, field: FieldNode, env: E
         const found = parsed !== null ? findIssueById(Number(parsed.key.split(':').pop())) : null;
         if (found === null) throw new GqlError('closeIssue: issue not found');
         found.issue.state = 'closed';
+        found.issue.rev += 1;
         return { __typename: 'CloseIssuePayload', issue: issueSource(found.repo, found.issue) };
       }
       if (field.name === 'createPullRequest') {
@@ -552,6 +553,7 @@ function resolveField(typeName: string, source: Source, field: FieldNode, env: E
           const found = findIssueById(numericId);
           if (found === null) throw new GqlError('addComment: subject not found');
           found.issue.comments.push(comment);
+          found.issue.rev += 1;
           return {
             __typename: 'AddCommentPayload',
             commentEdge: { __typename: 'IssueCommentEdge', node: { __typename: 'IssueComment', repo: found.repo, comment } },

@@ -10,13 +10,25 @@ import { handleMcp } from './mcp.ts';
 import { handleRest } from './rest.ts';
 import type { Ctx, Reply } from './http.ts';
 
+/** The shared empty body for requests that carry none. */
+const EMPTY_BODY = Buffer.alloc(0);
+
 function readBody(request: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     request.on('data', (chunk: Buffer) => chunks.push(chunk));
-    request.on('end', () => resolve(Buffer.concat(chunks)));
+    request.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     request.on('error', reject);
   });
+}
+
+/** Whether the request can carry a body at all: a GET or HEAD with no length and no transfer framing has none. */
+function mayCarryBody(request: IncomingMessage): boolean {
+  const method = request.method ?? 'GET';
+  if (method !== 'GET' && method !== 'HEAD') return true;
+  const length = request.headers['content-length'];
+  if (length !== undefined) return length !== '0';
+  return request.headers['transfer-encoding'] !== undefined;
 }
 
 function writeReply(response: ServerResponse, reply: Reply, isApi: boolean, requestId: string): void {
@@ -76,12 +88,13 @@ export function createApp(): Server {
   async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     requestCounter += 1;
     const requestId = `req-${requestCounter.toString(36)}`;
-    const rawBody = await readBody(request);
+    const rawBody = mayCarryBody(request) ? await readBody(request) : EMPTY_BODY;
     const url = new URL(request.url ?? '/', 'http://localhost');
     const segments = url.pathname
       .split('/')
       .filter((segment) => segment !== '')
       .map((segment) => {
+        if (!segment.includes('%')) return segment;
         try {
           return decodeURIComponent(segment);
         } catch {
@@ -91,7 +104,9 @@ export function createApp(): Server {
     const isApi = segments[0] === 'api';
     let json: unknown;
     let jsonError = false;
-    if (rawBody.length > 0) {
+    // Only the JSON surfaces (REST, GraphQL, MCP) ever look at the parsed body; the git
+    // surfaces read rawBody alone, so a pack's bytes are never fed to the JSON parser.
+    if (rawBody.length > 0 && (segments[0] === 'api' || segments[0] === 'mcp')) {
       try {
         json = JSON.parse(rawBody.toString('utf8'));
       } catch {

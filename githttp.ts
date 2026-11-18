@@ -12,9 +12,8 @@ import {
   encodePktLines,
   isAncestor,
   peelToCommit,
-  putObject,
   reachableSet,
-  readPack,
+  readPackObjects,
   shallowSet,
   sidebandPackets,
   writePack,
@@ -69,15 +68,18 @@ function v0Advertisement(repo: RepoRec, service: string): Buffer {
   return encodePktLines(lines);
 }
 
+/** The v2 advertisement names no repository state, so it is built once and shared. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  Buffer.from('version 2\n', 'utf8'),
+  Buffer.from(`agent=${AGENT}\n`, 'utf8'),
+  Buffer.from('ls-refs=unborn\n', 'utf8'),
+  Buffer.from('fetch=shallow\n', 'utf8'),
+  Buffer.from('object-format=sha1\n', 'utf8'),
+  'flush',
+]);
+
 function v2Advertisement(): Buffer {
-  return encodePktLines([
-    Buffer.from('version 2\n', 'utf8'),
-    Buffer.from(`agent=${AGENT}\n`, 'utf8'),
-    Buffer.from('ls-refs=unborn\n', 'utf8'),
-    Buffer.from('fetch=shallow\n', 'utf8'),
-    Buffer.from('object-format=sha1\n', 'utf8'),
-    'flush',
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -128,19 +130,26 @@ interface FetchArgs {
 /**
  * Packs for have-less fetches are a pure function of the (content-addressed, append-only)
  * object store, so they are cached by repo id, wants and depth: a burst of identical clones
- * builds its pack once. Any push clears the cache.
+ * builds its pack once. Any push clears the cache. The framed response bodies built from a
+ * cached pack are cached alongside it, so a repeat fetch is a single buffer hand-off.
  */
-const packCache = new Map<string, { pack: Buffer; shallowLines: string[] }>();
+interface FetchCacheEntry {
+  pack: Buffer;
+  shallowLines: string[];
+  v2Body?: Buffer;
+  v0Body?: Buffer;
+}
+const packCache = new Map<string, FetchCacheEntry>();
 const PACK_CACHE_LIMIT = 128;
 
-function computeFetch(repo: RepoRec, args: FetchArgs): { pack: Buffer; shallowLines: string[] } {
+function computeFetch(repo: RepoRec, args: FetchArgs): { pack: Buffer; shallowLines: string[]; entry?: FetchCacheEntry } {
   const cacheKey =
     args.haves.length === 0 && args.shallow.length === 0
       ? `${repo.id}|${[...args.wants].sort().join(',')}|${args.depth ?? 'full'}`
       : null;
   if (cacheKey !== null) {
     const hit = packCache.get(cacheKey);
-    if (hit !== undefined) return hit;
+    if (hit !== undefined) return { pack: hit.pack, shallowLines: hit.shallowLines, entry: hit };
   }
   const clientShallow = new Set(args.shallow);
   const held = args.haves.length > 0 ? reachableSet(repo.objects, args.haves, { stopAt: clientShallow }) : new Set<string>();
@@ -162,16 +171,18 @@ function computeFetch(repo: RepoRec, args: FetchArgs): { pack: Buffer; shallowLi
     const object = repo.objects.get(oid);
     if (object !== undefined) objects.push(object);
   }
-  const result = { pack: writePack(objects), shallowLines };
+  const result: FetchCacheEntry = { pack: writePack(objects), shallowLines };
   if (cacheKey !== null) {
     if (packCache.size >= PACK_CACHE_LIMIT) packCache.clear();
     packCache.set(cacheKey, result);
+    return { pack: result.pack, shallowLines: result.shallowLines, entry: result };
   }
-  return result;
+  return { pack: result.pack, shallowLines: result.shallowLines };
 }
 
 function fetchV2(repo: RepoRec, args: FetchArgs): Buffer {
-  const { pack, shallowLines } = computeFetch(repo, args);
+  const { pack, shallowLines, entry } = computeFetch(repo, args);
+  if (entry?.v2Body !== undefined) return entry.v2Body;
   const parts: Buffer[] = [];
   if (shallowLines.length > 0) {
     parts.push(encodePktLines([Buffer.from('shallow-info\n', 'utf8'), ...shallowLines.map((line) => Buffer.from(`${line}\n`, 'utf8')), 'delim']));
@@ -179,11 +190,14 @@ function fetchV2(repo: RepoRec, args: FetchArgs): Buffer {
   parts.push(encodePktLines([Buffer.from('packfile\n', 'utf8')]));
   parts.push(...sidebandPackets(1, pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  if (entry !== undefined) entry.v2Body = body;
+  return body;
 }
 
 function fetchV0(repo: RepoRec, args: FetchArgs): Buffer {
-  const { pack, shallowLines } = computeFetch(repo, args);
+  const { pack, shallowLines, entry } = computeFetch(repo, args);
+  if (entry?.v0Body !== undefined) return entry.v0Body;
   const parts: Buffer[] = [];
   if (shallowLines.length > 0) {
     parts.push(encodePktLines(shallowLines.map((line) => Buffer.from(`${line}\n`, 'utf8'))));
@@ -191,7 +205,9 @@ function fetchV0(repo: RepoRec, args: FetchArgs): Buffer {
   parts.push(encodePktLines([Buffer.from('NAK\n', 'utf8')]));
   parts.push(...sidebandPackets(1, pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  if (entry !== undefined) entry.v0Body = body;
+  return body;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -232,8 +248,10 @@ function receivePack(repo: RepoRec, body: Buffer): Reply {
   const report: string[] = [];
   if (packBytes.length > 0) {
     try {
-      const objects = readPack(packBytes, (oid) => repo.objects.get(oid));
-      for (const object of objects) putObject(repo.objects, object.type, object.data);
+      const objects = readPackObjects(packBytes, (oid) => repo.objects.get(oid));
+      for (const { oid, object } of objects) {
+        if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+      }
       packCache.clear();
       report.push('unpack ok');
     } catch (err) {

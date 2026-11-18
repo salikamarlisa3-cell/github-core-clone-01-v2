@@ -326,7 +326,23 @@ function patchIssue(ctx: Ctx, repo: RepoRec, issue: IssueRec): Reply {
   if (title !== undefined) issue.title = title;
   const text = stringField(body, 'body');
   if (text !== undefined) issue.body = text;
+  issue.rev += 1;
   return jsonReply(200, issueJson(repo, issue));
+}
+
+/**
+ * GET one issue, with the serialized body cached on the record: an issue's view changes
+ * only when the issue itself is patched, gains a comment, or the repo's labels change,
+ * and the revision counters name exactly those events.
+ */
+function getIssue(repo: RepoRec, issue: IssueRec): Reply {
+  const cached = issue.getCache;
+  if (cached !== undefined && cached.rev === issue.rev && cached.labelsRev === repo.labelsRev) {
+    return { status: 200, raw: cached.body, contentType: 'application/json; charset=utf-8' };
+  }
+  const body = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issue.getCache = { rev: issue.rev, labelsRev: repo.labelsRev, body };
+  return { status: 200, raw: body, contentType: 'application/json; charset=utf-8' };
 }
 
 /** The comment list a number names: an issue's, or a pull request's (GitHub shares the route). */
@@ -492,6 +508,7 @@ export function handleRest(ctx: Ctx): Reply {
         color: stringField(body, 'color') ?? 'ededed',
         description: stringField(body, 'description') ?? null,
       });
+      repo.labelsRev += 1;
       return jsonReply(201, labelJson(repo, labelName));
     }
     if (method === 'GET') return jsonReply(200, [...repo.labels.keys()].map((labelName) => labelJson(repo, labelName)));
@@ -509,7 +526,7 @@ export function handleRest(ctx: Ctx): Reply {
     if (tail.length === 2) {
       const issue = repo.issues.get(number);
       if (issue === undefined) return errorReply(404, NOT_FOUND);
-      if (method === 'GET') return jsonReply(200, issueJson(repo, issue));
+      if (method === 'GET') return getIssue(repo, issue);
       if (method === 'PATCH') return patchIssue(ctx, repo, issue);
       return errorReply(404, NOT_FOUND);
     }
@@ -526,6 +543,8 @@ export function handleRest(ctx: Ctx): Reply {
         if (text === undefined) return errorReply(422, 'Validation Failed: body is required');
         const comment = { id: forge.nextCommentId(), body: text, createdSeq: forge.seq() };
         target.comments.push(comment);
+        const commentedIssue = repo.issues.get(number);
+        if (commentedIssue !== undefined) commentedIssue.rev += 1;
         return jsonReply(201, commentJson(comment));
       }
       return errorReply(404, NOT_FOUND);

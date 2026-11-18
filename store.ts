@@ -48,6 +48,10 @@ export interface IssueRec {
   labels: string[];
   comments: CommentRec[];
   createdSeq: number;
+  /** Bumped on every mutation of the issue (patch, comment added); keys the GET response cache. */
+  rev: number;
+  /** The serialized GET /issues/{number} body, valid while `rev` and the repo's labelsRev stand. */
+  getCache?: { rev: number; labelsRev: number; body: Buffer };
 }
 
 export interface PullRec {
@@ -78,6 +82,8 @@ export interface RepoRec {
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
   labels: Map<string, LabelRec>;
+  /** Bumped whenever a label is created; label ids derive from label order, so views depend on it. */
+  labelsRev: number;
   issues: Map<number, IssueRec>;
   pulls: Map<number, PullRec>;
   nextNumber: number;
@@ -140,6 +146,7 @@ export class Forge {
       objects: new Map(),
       refs: new Map(),
       labels: new Map(),
+      labelsRev: 0,
       issues: new Map(),
       pulls: new Map(),
       nextNumber: 1,
@@ -161,9 +168,16 @@ export class Forge {
 
 export const forge = new Forge();
 
-/** An ISO timestamp for a logical second. */
+const isoCache = new Map<number, string>();
+
+/** An ISO timestamp for a logical second; the same seconds recur constantly, so they are memoized. */
 export function isoOf(sec: number): string {
-  return new Date(sec * 1000).toISOString();
+  const hit = isoCache.get(sec);
+  if (hit !== undefined) return hit;
+  const rendered = new Date(sec * 1000).toISOString();
+  if (isoCache.size > 65_536) isoCache.clear();
+  isoCache.set(sec, rendered);
+  return rendered;
 }
 
 /** The identity line REST/GraphQL-created commits carry. */
@@ -454,6 +468,7 @@ export function createIssue(repo: RepoRec, input: { title: string; body: string;
     labels: input.labels ?? [],
     comments: [],
     createdSeq: forge.seq(),
+    rev: 0,
   };
   repo.nextNumber += 1;
   repo.issues.set(issue.number, issue);
